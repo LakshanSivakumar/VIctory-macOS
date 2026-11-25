@@ -722,6 +722,67 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
 }
 
+/// The last exceptions the handler saw (#50: every thread was found in
+/// exception dispatch from the heap): code, kind (0 read, 1 write, 8
+/// execute), address, instruction, thread, what the handler returned
+/// (`usize::MAX` while running). Fixed, so noting one never allocates.
+static EXCEPTIONS: [[std::sync::atomic::AtomicUsize; 6]; 128] =
+    [const { [const { std::sync::atomic::AtomicUsize::new(0) }; 6] }; 128];
+static EXCEPTIONS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Notes an exception in [`EXCEPTIONS`]; its slot, for the outcome.
+fn note_exception(
+    p: &windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> Option<&'static [std::sync::atomic::AtomicUsize; 6]> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if p.ExceptionRecord.is_null() || p.ContextRecord.is_null() {
+        return None;
+    }
+    // SAFETY: the system's record and context for this exception.
+    let (r, c) = unsafe { (&*p.ExceptionRecord, &*p.ContextRecord) };
+    // Access violations only: others (illegal-instruction probes) flood it.
+    if r.ExceptionCode != windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION {
+        return None;
+    }
+    let n = EXCEPTIONS_SEEN.fetch_add(1, Relaxed);
+    let slot = &EXCEPTIONS[n % EXCEPTIONS.len()];
+    let params = r.NumberParameters as usize;
+    // SAFETY: no arguments.
+    let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    for (field, value) in slot.iter().zip([
+        r.ExceptionCode as u32 as usize,
+        if params > 0 { r.ExceptionInformation[0] } else { usize::MAX },
+        if params > 1 { r.ExceptionInformation[1] } else { 0 },
+        c.Rip as usize,
+        thread as usize,
+        usize::MAX,
+    ]) {
+        field.store(value, Relaxed);
+    }
+    Some(slot)
+}
+
+/// Writes the exceptions noted (oldest first), one line each, for a stack
+/// dump.
+pub fn exception_lines(out: &mut dyn FnMut(std::fmt::Arguments)) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let seen = EXCEPTIONS_SEEN.load(Relaxed);
+    out(format_args!("exceptions seen by the fault handler: {seen}"));
+    for n in seen.saturating_sub(EXCEPTIONS.len())..seen {
+        let e = &EXCEPTIONS[n % EXCEPTIONS.len()];
+        let v: [usize; 6] = std::array::from_fn(|i| e[i].load(Relaxed));
+        out(format_args!(
+            "  exception #{n} code {:#x} kind {} at {:#x} rip {:#x} thread {} returned {}",
+            v[0],
+            v[1] as isize,
+            v[2],
+            v[3],
+            v[4],
+            if v[5] == usize::MAX { "running".to_string() } else { (v[5] as u32 as i32).to_string() }
+        ));
+    }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -731,6 +792,16 @@ fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: the system passes the exception being dispatched.
+        let slot = unsafe { note_exception(&*info) };
+        // SAFETY: as above.
+        let ret = unsafe { handle_write(info) };
+        if let Some(slot) = slot {
+            slot[5].store(ret as u32 as usize, std::sync::atomic::Ordering::Relaxed);
+        }
+        ret
+    }
+    unsafe extern "system" fn handle_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
@@ -772,6 +843,7 @@ fn install() {
     });
 }
 
+/// Whether `at` is committed read-write memory now.
 /// Whether `at` is committed memory that is read-only, as our guards make
 /// it.
 fn read_only(at: usize) -> bool {
@@ -785,7 +857,6 @@ fn read_only(at: usize) -> bool {
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READONLY
 }
 
-/// Whether `at` is committed read-write memory now.
 fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
@@ -812,6 +883,15 @@ impl Drop for Timed {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn exceptions_the_handler_sees_are_listed() {
+        a_fault_under_the_guard_lock_does_not_hang();
+        let mut lines = Vec::new();
+        exception_lines(&mut |a| lines.push(a.to_string()));
+        assert!(lines[0].starts_with("exceptions seen by the fault handler: "));
+        assert!(lines.iter().any(|l| l.contains("code 0xc0000005 kind 1") && l.contains("returned -1")), "{lines:?}");
+    }
 
     #[test]
     fn a_fault_under_the_guard_lock_does_not_hang() {

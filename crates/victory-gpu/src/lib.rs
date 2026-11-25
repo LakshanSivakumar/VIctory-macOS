@@ -73,8 +73,8 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, fault_tracking, title_memory_aliased, title_memory_remapped,
-    writing as kernel_will_write,
+    Writing as KernelWrite, exception_lines, fault_tracking, title_memory_aliased,
+    title_memory_remapped, writing as kernel_will_write,
 };
 
 /// A whole file, read without asking for its size or other metadata.

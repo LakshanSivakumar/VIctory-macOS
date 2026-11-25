@@ -98,9 +98,31 @@ fn modules(file: &std::fs::File) {
     unsafe { CloseHandle(snapshot) };
 }
 
+/// Writes lines, one call each, through the sink it is given.
+pub type Lines = fn(&mut dyn FnMut(std::fmt::Arguments));
+
+/// Extra lines each file dump writes first (the runtime's exception log).
+static EXTRA: std::sync::OnceLock<Lines> = std::sync::OnceLock::new();
+
+/// Has every file dump start with the lines `f` gives.
+pub fn on_dump(f: Lines) {
+    let _ = EXTRA.set(f);
+}
+
 /// [`dump_stacks`] into `file`, with a line before each step, so a dump
 /// that stops shows where.
 fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>) {
+    if let Some(extra) = EXTRA.get() {
+        extra(&mut |args| line(file, args));
+    }
+    // In the #50 freeze the snapshot itself never returns, so only the
+    // first dump takes one; later dumps reuse its thread ids (threads made
+    // since are missed).
+    if !ids.is_empty() {
+        line(file, format_args!("dump at {at} s: reusing {} thread ids", ids.len()));
+        dump_threads(file, at, ids);
+        return;
+    }
     line(file, format_args!("dump at {at} s: taking a thread snapshot"));
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
@@ -125,7 +147,29 @@ fn dump_raw(file: &std::fs::File, at: u64, ids: &mut Vec<u32>) {
     }
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
+    // Our pipeline workers first, named now while all is well: in #50 they
+    // hold Wine's virtual-memory lock while parked, so their contexts are
+    // readable, unlike threads stuck in a fault later in the list.
+    ids.sort_by_key(|&id| {
+        // SAFETY: opens a thread of our own process.
+        let thread = unsafe { OpenThread(THREAD_QUERY_INFORMATION, 0, id) };
+        if thread.is_null() {
+            return true;
+        }
+        let name = name_of(thread);
+        let first = name.starts_with("victory-pipelines");
+        if first {
+            line(file, format_args!("  thread {id} is {name}"));
+        }
+        // SAFETY: we opened it.
+        unsafe { CloseHandle(thread) };
+        !first
+    });
     line(file, format_args!("dump at {at} s: {} threads", ids.len()));
+    dump_threads(file, at, ids);
+}
+
+fn dump_threads(file: &std::fs::File, at: u64, ids: &[u32]) {
     for &id in ids.iter() {
         line(file, format_args!("  thread {id}: opening"));
         // SAFETY: opens a thread of our own process.
@@ -330,6 +374,8 @@ mod tests {
         modules(&file);
         let mut ids = Vec::with_capacity(8192);
         dump_raw(&file, 7, &mut ids);
+        // A second dump takes no snapshot.
+        dump_raw(&file, 8, &mut ids);
         drop(tx);
         sleeper.join().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -337,7 +383,10 @@ mod tests {
         assert!(text.contains("dump at 7 s: taking a thread snapshot"));
         assert!(text.contains("frames"), "{text}");
         assert!(text.contains("    #0  0x"), "{text}");
-        assert!(text.trim_end().ends_with("dump at 7 s: done"), "{text}");
+        assert!(text.contains("dump at 7 s: done"), "{text}");
+        assert!(!text.contains("dump at 8 s: taking a thread snapshot"), "{text}");
+        assert!(text.contains("dump at 8 s: reusing"), "{text}");
+        assert!(text.trim_end().ends_with("dump at 8 s: done"), "{text}");
     }
 
     #[test]
